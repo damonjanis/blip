@@ -61,7 +61,7 @@ FocusScope {
   readonly property color dim: appearance.muted
   /** An editor owns the keyboard — the host's key catcher must stand down. */
   readonly property bool editorActive:
-    messageMenu.visible || contactReview.opened || composeField.activeFocus || searchField.activeFocus || newField.activeFocus || bubbleFocused
+    messageMenu.visible || contactMenu.visible || pendingDelete !== null || contactReview.opened || composeField.activeFocus || searchField.activeFocus || newField.activeFocus || bubbleFocused
   readonly property alias composeEditor: composeField
   readonly property real contentHeightHint: listContent.implicitHeight
   /** The view wants keyboard navigation focus back (list mode). */
@@ -564,8 +564,8 @@ FocusScope {
   }
   /** The one gate for "this thread was looked at": a surface that marks read,
    *  and not a thread merely peeked. */
-  function markRead(chat, seen) {
-    if (hostWidget && readActive && !peeking) hostWidget.markThreadRead(chat, seen)
+  function markRead(chat, seen, act) {
+    if (hostWidget && readActive && !peeking) hostWidget.markThreadRead(chat, seen, act)
   }
   function showThread(t) {
     messageMenu.close()
@@ -716,6 +716,24 @@ FocusScope {
     if (!root.hostWidget || root.unread === 0) return
     root.hostWidget.markAllRead()
   }
+  function markUnread(t) {
+    if (!t || !root.hostWidget) return
+    if (isShowing(t) || (inThread && String(active.chat) === String(t.chat))) back()
+    root.hostWidget.markThreadUnread(String(t.chat))
+  }
+  property var pendingDelete: null
+  function requestDelete(t) {
+    if (!t) return
+    pendingDelete = t
+  }
+  function confirmDelete() {
+    var t = pendingDelete
+    pendingDelete = null
+    if (!t || !root.hostWidget) return
+    if (isShowing(t) || (inThread && String(active.chat) === String(t.chat))) back()
+    root.hostWidget.deleteThread(String(t.chat))
+  }
+  function cancelDelete() { pendingDelete = null }
 
   /** Chip icon for an attachment's mime type. */
   function attachmentIcon(mime) {
@@ -1618,7 +1636,7 @@ FocusScope {
             var seen = ""
             for (var k = 0; k < list.length; k++) {
               if (list[k].pending === true || list[k].scheduled === true) continue
-              var ts = String(list[k].ts || ""); if (ts > seen) seen = ts
+              var ts = String(list[k].seen_ts || list[k].ts || ""); if (ts > seen) seen = ts
             }
             // thread.ts hands back the sends it is still waiting on for this
             // chat; keep asking for a few seconds, then leave it to the next
@@ -2092,6 +2110,12 @@ FocusScope {
       openThread(threads[i])
       return true
     }
+    if (text === "u" || text === "U") {
+      if (searching || newMode) return false
+      var t = threads[cursor]
+      if (t) markUnread(t)
+      return true
+    }
     if ((inThread && !splitView) || searching || newMode) return false
     if (text === "r" || text === "R") { if (hostWidget) hostWidget.refresh(true, false); return true }
     if (text === "a" || text === "A") { markAllRead(); return true }
@@ -2100,6 +2124,7 @@ FocusScope {
   function catchNavText(text) {
     if (contactReview.opened) return false
     var jump = text === "/" || text === "n" || text === "N"
+      || text === "u" || text === "U"
       || (text >= "1" && text <= "9")
     if (!jump) return false
     if (searchField.activeFocus || newField.activeFocus || bubbleFocused) return false
@@ -2138,6 +2163,7 @@ FocusScope {
   /** Esc semantics for a host without a PanelKeyCatcher (the window): true if
    *  something was unwound, false if the host should close. */
   function unwind() {
+    if (pendingDelete) { cancelDelete(); return true }
     if (contactReview.opened) { contactReview.back(); return true }
     if (shareUrl !== "") { closeShare(); return true }
     if (catchEscape()) return true
@@ -3916,11 +3942,144 @@ FocusScope {
   }
 
   property var contactContext: null
+  function isDmChat(t) {
+    var c = t ? String(t.chat || "") : ""
+    return /^\+?[0-9]{3,15}$/.test(c) || c.indexOf("@") > 0
+  }
+  function closeConversationMenu() { contactMenu.close() }
+  function openConversationMenu(thread) {
+    contactContext = thread
+    contactMenu.popup()
+  }
+  function menuIcon(name) { return Qt.resolvedUrl("icons/" + name + ".svg") }
   Menu {
     id: contactMenu
+    width: 240
     MenuItem {
       text: "Review contact"
       onTriggered: if (root.contactContext) contactReview.review(root.contactContext)
+    }
+    MenuSeparator {}
+    MenuItem {
+      text: root.contactContext && root.contactContext.pinned ? "Unpin" : "Pin"
+      icon.source: root.menuIcon("pin")
+      enabled: root.isDmChat(root.contactContext)
+      onTriggered: {
+        var t = root.contactContext
+        if (t && root.hostWidget) root.hostWidget.conversationAct(t.pinned ? "unpin" : "pin", t.chat)
+      }
+    }
+    MenuSeparator {}
+    MenuItem {
+      visible: !(root.contactContext && Number(root.contactContext.unread || 0) > 0)
+      height: visible ? implicitHeight : 0
+      text: "Mark as Unread"
+      icon.source: root.menuIcon("unread")
+      enabled: root.isDmChat(root.contactContext)
+      onTriggered: if (root.contactContext) root.markUnread(root.contactContext)
+    }
+    MenuItem {
+      visible: root.contactContext && Number(root.contactContext.unread || 0) > 0
+      height: visible ? implicitHeight : 0
+      text: "Mark as Read"
+      icon.source: root.menuIcon("read")
+      onTriggered: {
+        var t = root.contactContext
+        if (!t) return
+        root.peeking = false
+        root.markRead(String(t.chat), String(t.last_ts || ""), root.isDmChat(t) ? "read" : "")
+      }
+    }
+    MenuItem {
+      text: root.contactContext && root.contactContext.muted ? "Show Alerts" : "Hide Alerts"
+      icon.source: root.menuIcon("moon")
+      enabled: root.isDmChat(root.contactContext)
+      onTriggered: {
+        var t = root.contactContext
+        if (t && root.hostWidget) root.hostWidget.conversationAct(t.muted ? "unmute" : "mute", t.chat)
+      }
+    }
+    MenuSeparator {}
+    MenuItem {
+      text: "Delete"
+      icon.source: root.menuIcon("trash")
+      enabled: root.isDmChat(root.contactContext)
+      onTriggered: if (root.contactContext) root.requestDelete(root.contactContext)
+    }
+  }
+  Rectangle {
+    objectName: "blipDeleteConfirm"
+    visible: root.pendingDelete !== null
+    z: 1100
+    anchors.fill: parent
+    color: Qt.rgba(0, 0, 0, 0.45)
+    TapHandler { onTapped: root.cancelDelete() }
+    Rectangle {
+      anchors.centerIn: parent
+      width: Math.min(parent.width - Style.space(32), Style.space(320))
+      implicitHeight: delCol.implicitHeight + Style.space(24)
+      radius: Style.cornerRadius
+      color: Color.background
+      border.width: 1
+      border.color: root.dim
+      TapHandler { } // swallow
+      ColumnLayout {
+        id: delCol
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.margins: Style.space(16)
+        spacing: Style.space(12)
+        Text {
+          Layout.fillWidth: true
+          text: "Delete this conversation?"
+          textFormat: Text.PlainText
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: root.fontBody
+          font.bold: true
+          wrapMode: Text.WordWrap
+        }
+        Text {
+          Layout.fillWidth: true
+          text: "It is removed from Messages on the Mac and this computer. For about 30 days you can recover it from Recently Deleted on the Mac or iPhone."
+          textFormat: Text.PlainText
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: root.fontCaption
+          wrapMode: Text.WordWrap
+        }
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(8)
+          Item { Layout.fillWidth: true }
+          Text {
+            text: "Cancel"
+            textFormat: Text.PlainText
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: root.fontBodySmall
+            TapHandler { onTapped: root.cancelDelete() }
+          }
+          Rectangle {
+            implicitWidth: delBtn.implicitWidth + Style.space(16)
+            implicitHeight: delBtn.implicitHeight + Style.space(10)
+            radius: Style.cornerRadius
+            color: root.urgent
+            Text {
+              id: delBtn
+              anchors.centerIn: parent
+              text: "Delete"
+              textFormat: Text.PlainText
+              color: "#ffffff"
+              font.family: root.fontFamily
+              font.pixelSize: root.fontBodySmall
+              font.bold: true
+            }
+            TapHandler { onTapped: root.confirmDelete() }
+          }
+        }
+      }
     }
   }
   ContactReview {
