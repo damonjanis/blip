@@ -16,7 +16,6 @@ Going through Messages means the change syncs the way any read does.
     imsg-read --all              mark every conversation read
     imsg-read --chat <handle>    mark ONE conversation read (DMs only)
     imsg-read --unread <handle>  mark ONE conversation unread (DMs only)
-    imsg-read --delete <handle>  delete ONE conversation (DMs only)
     imsg-read --pin <handle>     pin a DM
     imsg-read --unpin <handle>   unpin a DM
     imsg-read --mute <handle>    Hide Alerts
@@ -52,8 +51,6 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from read_state import read_state
 
 MENU = 'menu 1 of menu bar item "Conversation" of menu bar 1'
-FILE_MENU = 'menu 1 of menu bar item "File" of menu bar 1'
-DELETE_ITEMS = ("Delete Conversation…", "Delete Conversation...", "Delete Conversation")
 PINNING_PLIST_PATHS = (
     os.path.expanduser("~/Library/Preferences/com.apple.messages.pinning.plist"),
     os.path.expanduser(
@@ -96,7 +93,7 @@ def newer_than_seen(handle, seen):
         # Wire stamps have second precision; include the whole visible second.
         with sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5) as con:
             return any(row["latest"] >= boundary + 1000000000 for row in read_state(con)
-                       if row["chat"] == handle or handle in row["aliases"])
+                       if not handle or row["chat"] == handle or handle in row["aliases"])
     except Exception:
         return True  # cannot safely apply a stale read
 
@@ -221,41 +218,6 @@ def click(item: str, menu: str = MENU) -> tuple[bool, str]:
     return (code == 0), ("" if code == 0 else out)
 
 
-def chat_present(handle: str) -> Optional[bool]:
-    """True if Messages still has a chat row for this handle."""
-    try:
-        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
-        try:
-            n = con.execute(
-                "SELECT count(*) FROM chat WHERE chat_identifier = ?", (handle,)
-            ).fetchone()[0]
-            return int(n) > 0
-        finally:
-            con.close()
-    except Exception:
-        return None
-
-
-def confirm_delete_sheet() -> tuple[bool, str]:
-    """Click Delete on Messages' confirmation sheet, if it appeared."""
-    for _ in range(20):
-        code, out = osa(
-            'tell application "System Events" to tell process "Messages" to '
-            '(exists sheet 1 of window 1)'
-        )
-        if code == 0 and out == "true":
-            for label in ("Delete", "Delete Conversation"):
-                c2, o2 = osa(
-                    'tell application "System Events" to tell process "Messages" to '
-                    f'click button "{label}" of sheet 1 of window 1'
-                )
-                if c2 == 0:
-                    return True, ""
-            return False, o2 or "could not click Delete on the confirmation sheet"
-        time.sleep(0.2)
-    return False, "no confirmation sheet appeared"
-
-
 def chat_muted(handle: str) -> Optional[bool]:
     try:
         con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
@@ -328,49 +290,6 @@ def settle_flag(fn, want: bool, tries: int = 8, pause: float = 0.4) -> Optional[
         time.sleep(pause)
         got = fn()
     return got
-
-
-def delete_conversation(handle: str) -> None:
-    """File/Conversation ▸ Delete Conversation, then the confirmation sheet."""
-    before = chat_present(handle)
-    why = select_chat(handle)
-    if why:
-        sys.stderr.write(f"imsg-read: {why}\n")
-        sys.exit(64)
-    prev = wake_messages()
-    ok, err = False, ""
-    for menu in (MENU, FILE_MENU):
-        for name in DELETE_ITEMS:
-            ok, err = click(name, menu)
-            if ok or err:
-                break
-        if ok or err:
-            break
-    if err:
-        restore_front(prev)
-        sys.stderr.write(f"imsg-read: {err}\n")
-        sys.exit(1)
-    if not ok:
-        restore_front(prev)
-        sys.stderr.write("imsg-read: Delete Conversation was not in the File or Conversation menu\n")
-        sys.exit(1)
-    sheet_ok, sheet_err = confirm_delete_sheet()
-    restore_front(prev)
-    if not sheet_ok:
-        sys.stderr.write(f"imsg-read: {sheet_err}\n")
-        sys.exit(1)
-    after = before
-    for _ in range(8):
-        time.sleep(0.4)
-        after = chat_present(handle)
-        if after is False:
-            print("deleted")
-            return
-    if after is None:
-        sys.stderr.write("imsg-read: could not verify deletion in chat.db\n")
-        sys.exit(75)
-    sys.stderr.write("imsg-read: Delete was clicked but the conversation is still in chat.db\n")
-    sys.exit(75)
 
 
 def frontmost() -> str:
@@ -453,16 +372,39 @@ def main() -> None:
         sys.exit(77)
 
     if argv[0] == "--all":
+        def guard():
+            if "--through" in argv:
+                i = argv.index("--through")
+                if i + 1 >= len(argv) or newer_than_seen(None, argv[i + 1]):
+                    sys.stderr.write("imsg-read: newer inbound arrived; global read cancelled\n")
+                    sys.exit(76)  # terminal stale intent, not a retryable failure
+            if "--through-row" in argv:
+                try:
+                    limit = int(argv[argv.index("--through-row") + 1])
+                    con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
+                    try:
+                        newer = any(row["max_id"] > limit for row in read_state(con))
+                    finally:
+                        con.close()
+                    if limit < 0 or newer:
+                        raise ValueError("newer inbound")
+                except Exception:
+                    sys.stderr.write("imsg-read: newer or unverified inbound; global read cancelled\n")
+                    sys.exit(76)
         before = unread_on_mac()
         if before == 0:
             print("nothing unread")
             return
+        guard()
         ok, err = click("Mark All as Read")
         if not ok and not err and before:
             # Disabled, yet chat.db says unread: the menu is dormant, not empty.
             prev = wake_messages()
-            ok, err = click("Mark All as Read")
-            restore_front(prev)
+            try:
+                guard()
+                ok, err = click("Mark All as Read")
+            finally:
+                restore_front(prev)
         if err:
             sys.stderr.write(f"imsg-read: {err}\n")
             sys.exit(1)
@@ -485,7 +427,7 @@ def main() -> None:
             i = argv.index("--through")
             if i + 1 >= len(argv) or newer_than_seen(handle, argv[i + 1]):
                 sys.stderr.write("imsg-read: newer inbound arrived; leaving it unread\n")
-                sys.exit(75)
+                sys.exit(76)
         prev = frontmost()
         try:
             why = select_chat(handle)
@@ -507,13 +449,6 @@ def main() -> None:
                 report(before, after, ok, item)
         finally:
             restore_front(prev)
-        return
-
-    if argv[0] == "--delete":
-        if len(argv) < 2:
-            sys.stderr.write("imsg-read: --delete needs a handle\n")
-            sys.exit(64)
-        delete_conversation(argv[1])
         return
 
     acts = {

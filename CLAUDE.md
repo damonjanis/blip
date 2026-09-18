@@ -189,7 +189,11 @@ what it is handed. Keep it that way.
 - **Read sync is an acknowledged, durable action queue.** `pendingReads` in
   state.json stores only chat ids, desired read/unread state, visible timestamps,
   retry counters/deadlines and bounded bridge status errors. Persist BEFORE any
-  Mac mutation, then execute one due action per collector run. Never detach it.
+  Mac mutation. `read-worker.ts` executes outside the collector so consent
+  prompts and slow SSH do not block message polling. A single durable mailbox
+  lives under `read-worker/`; Linux `flock` excludes duplicate workers. Only
+  the collector writes state.json. Job and intent ids fence stale completions;
+  retries get a new id so an acknowledgement is applied at most once.
   A failed action survives restarts and retries with backoff (2–60 seconds).
   `imsg read-state` returns the COMPLETE metadata-only unread snapshot; it is
   independent of the message preview window. `read_state.py` is shared with
@@ -201,8 +205,12 @@ what it is handed. Keep it that way.
   Compare remote unread against the rendered `--seen` BEFORE updating local
   marks. A stale read must not clear a newer inbound; recheck with `--through`
   on the Mac. Newer explicit gestures replace old same-chat pending intents.
-  Mark-all is ordered before subsequent per-chat intents; refresh coalescing
-  never crosses an explicit gesture. Mac menu actions hold an advisory lock
+  Mark-all captures the previous snapshot's maximum inbound row id and a
+  timestamp boundary. A newer row (including in the same second) cancels it.
+  The Mac rechecks before clicking, including after waking Messages. A later
+  per-chat gesture supersedes a pending global action instead of starving behind
+  its failures. In-flight work finishes before a successor starts; refresh
+  coalescing never crosses an explicit gesture. Mac menu actions hold an advisory lock
   because Messages selection is process-global. `push_read` still defaults to
   `all`; this installation may opt into `thread` in bridge.conf. `off` suppresses
   explicit menu read pushes too. `read_push=` reports policy; `watch=` reports

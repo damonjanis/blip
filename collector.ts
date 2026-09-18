@@ -18,14 +18,15 @@
  *   bun collector.ts --mark-unread <chat>  # blue-dot that thread again
  */
 
+import { readWorkerState, scheduleReadJob } from "./read-worker";
 import { shimPath } from "./shim-path";
 import { openSync, writeSync, fsyncSync, closeSync } from "node:fs";
 import { homedir } from "node:os";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { parseReadSnapshot, parseReadIntents, queueReadIntent, retryReadIntent, reconcileReadIntents,
+import { parseReadSnapshot, parseReadIntents, queueReadIntent, queueMenuIntent, reconcileReadIntents,
   type ReadSnapshot, type ReadIntents } from "./read-sync";
 
 const HOME = process.env.HOME ?? homedir();
@@ -160,6 +161,9 @@ export interface GroupInfo {
 
 export interface BlipState {
   pendingReads?: ReadIntents;
+  readRowId?: number;
+  readAllRowId?: number;
+  alertMuted?: string[];
   watermark: string;
   readMark: string;
   /** Exact unread ledger, independent of the bounded preview window. */
@@ -278,6 +282,9 @@ export function loadState(path = STATE_PATH): BlipState {
     const ledgerComplete = Object.entries(unreadCounts)
       .every(([chat, count]) => count === 0 || unreadOldest[chat]);
     return {
+      ...(Array.isArray(s.alertMuted) ? { alertMuted: s.alertMuted.filter((x): x is string => typeof x === "string") } : {}),
+      ...(Number.isSafeInteger(s.readAllRowId) && s.readAllRowId! >= 0 ? { readAllRowId: s.readAllRowId } : {}),
+      ...(Number.isSafeInteger(s.readRowId) && s.readRowId! >= 0 ? { readRowId: s.readRowId } : {}),
       ...(s.pendingReads ? { pendingReads: parseReadIntents(s.pendingReads) } : {}),
       watermark,
       // Pre-two-mark state files have no readMark. Inheriting the watermark is
@@ -1107,129 +1114,16 @@ export function pushReadPolicy(path = BRIDGE_CONF): PushRead {
   return "all";
 }
 
-/** What to hand `imsg-read`, or null when this run should tell the Mac nothing. */
-export function pushReadArgs(
-  policy: PushRead,
-  opts: { markRead: boolean; readChat: string; clearedUnread?: boolean },
-): string[] | null {
-  if (policy === "off") return null;
-  if (opts.markRead) return ["--all"];
-  if (policy !== "thread") return null;
-  // Only when this run turned unread into read. A poll that cleared nothing
-  // has nothing to tell the Mac, and telling it anyway opens the conversation
-  // there — once per poll for as long as the thread stays open.
-  if (opts.clearedUnread === false) return null;
-  const chat = String(opts.readChat || "");
-  // Groups have no imessage:// form, so only a DM can be aimed at.
-  if (!/^\+?[0-9]{3,15}$/.test(chat) && !/^[^@\s]+@[^@\s]+$/.test(chat)) return null;
-  return ["--chat", chat];
-}
-
-/** Explicit "mark as unread" always tells the Mac (unless push_read=off).
- *  Groups have no imessage:// form, same as per-thread mark-read. */
 export function pushUnreadArgs(chat: string): string[] | null {
   const id = String(chat || "");
   if (!/^\+?[0-9]{3,15}$/.test(id) && !/^[^@\s]+@[^@\s]+$/.test(id)) return null;
   return ["--unread", id];
 }
 
-/** Wait for Messages to mark the chat unread. Detached push hid Accessibility
- *  failures while Blip showed a local dot. */
-export function markUnreadOnMac(chat: string, home = HOME, runner = spawnSync): { ok: boolean; error: string } {
-  const args = pushUnreadArgs(chat);
-  if (!args) return { ok: false, error: "groups cannot be marked unread on the Mac" };
-  try {
-    const r = runner(`${home}/bin/imsg-read`, args, { encoding: "utf8", timeout: 60000 });
-    if ((r.status ?? 1) === 0) return { ok: true, error: "" };
-    const msg = String(r.stderr || r.stdout || "unread push failed").trim().split("\n").pop() || "unread push failed";
-    return { ok: false, error: msg.slice(0, 240) };
-  } catch (e) {
-    return { ok: false, error: String(e).slice(0, 240) };
-  }
-}
-
 /** DMs only: groups have no imessage:// form, same as per-thread mark-read. */
-export function canDeleteChat(chat: string): boolean {
+export function canAddressChat(chat: string): boolean {
   const id = String(chat || "");
   return /^\+?[0-9]{3,15}$/.test(id) || /^[^@\s]+@[^@\s]+$/.test(id);
-}
-
-const CONVERSATION_ACTS: Record<string, string> = {
-  pin: "--pin", unpin: "--unpin", mute: "--mute", unmute: "--unmute",
-  read: "--chat", unread: "--unread",
-};
-
-/** Pin / mute / read / unread through Messages' Conversation menu. DMs only. */
-export function conversationAct(act: string, chat: string, home = HOME, runner = spawnSync): { ok: boolean; error: string } {
-  const flag = CONVERSATION_ACTS[act];
-  if (!flag) return { ok: false, error: "unknown action" };
-  if (!canDeleteChat(chat)) return { ok: false, error: "groups cannot use this action from here" };
-  try {
-    const r = runner(`${home}/bin/imsg-read`, [flag, chat], { encoding: "utf8", timeout: 60000 });
-    if ((r.status ?? 1) === 0) return { ok: true, error: "" };
-    const msg = String(r.stderr || r.stdout || "action failed").trim().split("\n").pop() || "action failed";
-    return { ok: false, error: msg.slice(0, 240) };
-  } catch (e) {
-    return { ok: false, error: String(e).slice(0, 240) };
-  }
-}
-
-/** Ask Messages to delete a conversation. Never writes chat.db itself. */
-export function deleteConversation(chat: string, home = HOME, runner = spawnSync): { ok: boolean; error: string } {
-  if (!canDeleteChat(chat)) {
-    return { ok: false, error: "groups cannot be deleted from here" };
-  }
-  try {
-    const r = runner(`${home}/bin/imsg-read`, ["--delete", chat], {
-      encoding: "utf8", timeout: 60000,
-    });
-    if ((r.status ?? 1) === 0) return { ok: true, error: "" };
-    const msg = String(r.stderr || r.stdout || "delete failed").trim().split("\n").pop() || "delete failed";
-    return { ok: false, error: msg.slice(0, 200) };
-  } catch (e) {
-    return { ok: false, error: String(e).slice(0, 200) };
-  }
-}
-
-/**
- * Tell the Mac, without making the caller wait. The click costs a second or
- * two of AppleScript; a poll must not stall behind it, and a failure must
- * never turn into a failed refresh — the local marks have already moved.
- */
-export function pushRead(args: string[] | null, home = HOME): void {
-  if (!args) return;
-  try {
-    const child = spawn("sh", pushReadCommand(shimPath("imsg-read", home), args, pushReadLogPath(home)),
-      { detached: true, stdio: "ignore" });
-    child.unref();
-  } catch { /* no shim, no Mac, no matter */ }
-}
-
-/** Where a push's outcome is recorded. Timestamps, args and imsg-read's own
- *  status line only — no message content ever reaches this file. */
-export function pushReadLogPath(home = HOME): string {
-  return `${home}/.local/state/blip/push-read.log`;
-}
-
-/**
- * The detached push wrapped so its OUTCOME survives it. The collector exits
- * before imsg-read finishes and cannot collect the exit code itself; without
- * this a push that fails (Accessibility revoked, Messages without a window,
- * the Mac asleep) is indistinguishable from one that worked — the local marks
- * cleared, the phone kept its badge, and nothing anywhere said why. Found
- * 2026-09-04: one unread cleared in Blip, still unread on Apple's side, no
- * evidence in either direction. Keeps the last ~100 lines, 0600.
- */
-export function pushReadCommand(bin: string, args: string[], log: string): string[] {
-  const script = [
-    'umask 077',
-    'log="$1"; bin="$2"; shift 2',
-    'out=$("$bin" "$@" 2>&1); rc=$?',
-    'printf "%s %s exit=%s %s\\n" "$(date +%FT%T)" "$*" "$rc" "${out:0:200}" >> "$log"',
-    '[ "$(wc -c < "$log")" -gt 65536 ] && { tail -n 100 "$log" > "$log.tmp" && mv "$log.tmp" "$log"; }',
-    'exit $rc',
-  ].join('; ');
-  return ["-c", script, "sh", log, bin, ...args];
 }
 
 /** How far back a delivery failure is still worth interrupting for. */
@@ -2038,52 +1932,44 @@ export function fetchGroups(runner = spawnSync): Record<string, GroupInfo> | nul
 
 // ---------------------------------------------------------------- main
 
-export function runReadAction(args: string[], runner = spawnSync): { ok: boolean; error: string } {
-  try {
-    const r = runner(`${HOME}/bin/imsg-read`, args, { encoding: "utf8", timeout: 180000 });
-    const ok = r.status === 0;
-    try {
-      const log = pushReadLogPath();
-      mkdirSync(dirname(log), { recursive: true, mode: 0o700 });
-      appendFileSync(log, `${new Date().toISOString()} ${args.join(" ")} exit=${r.status ?? "timeout"} ${String(r.stderr || r.stdout).trim().replace(/[\r\n]/g, " ").slice(0, 240)}\n`, { mode: 0o600 });
-      const lines = readFileSync(log, "utf8");
-      if (lines.length > 65536) writeFileSync(log, lines.split("\n").slice(-101).join("\n"), { mode: 0o600 });
-    } catch { /* read intent remains durable even if diagnostics cannot be saved */ }
-    // Status only: no message contents. Keep errors visible until retry succeeds.
-    return { ok, error: ok ? "" : String(r.stderr || r.stdout || "Mac read action failed").trim().slice(-240) };
-  } catch { return { ok: false, error: "Mac read action could not start" }; }
-}
+
 
 export function fetchReadSnapshot(runner = spawnSync): ReadSnapshot | null {
   try {
-    const r = runner(`${HOME}/bin/imsg`, ["--json", "read-state"], {
+    const r = runner(shimPath("imsg"), ["--json", "read-state"], {
       encoding: "utf8", timeout: 20000, maxBuffer: 16 * 1024 * 1024,
     });
     return r.status === 0 ? parseReadSnapshot(JSON.parse(String(r.stdout))) : null;
   } catch { return null; }
 }
 
-export function collect(deep: boolean, markRead = false, readChat = "", seenTs = "", unreadChat = "", explicitRead = false): BlipOutput {
+export function collect(deep: boolean, markRead = false, readChat = "", seenTs = "", unreadChat = "", explicitRead = false, menuAction = "", menuTarget = ""): BlipOutput {
   // When this POLL ran — the output's own metadata, not a message stamp.
   // Distinct from nowTs() below, which is the clock message stamps are
   // measured against and therefore has to be in the wire format.
   const producedAt = new Date().toISOString();
   const state = loadState();
   const readPush = pushReadPolicy();
-  let pendingReads = readPush === "off" ? {} : { ...state.pendingReads };
+  const globalSeen = seenTs || state.watermark;
+  const worker = readWorkerState(HOME, state.pendingReads ?? {});
+  if (worker.completed) deep = true; // refresh pin and alert metadata after acknowledgement
+  let pendingReads = readPush === "off"
+    ? Object.fromEntries(Object.entries(worker.pending).filter(([, r]) => r.action))
+    : { ...worker.pending };
+  if (menuAction && canAddressChat(menuTarget)) pendingReads = queueMenuIntent(pendingReads, menuTarget, menuAction);
   // Persist explicit intent before any network call. An offline click survives
   // the collector exiting and is retried after reconnection.
   if (readPush !== "off") {
-    if (markRead) pendingReads = queueReadIntent(pendingReads, "*", false);
+    if (markRead) pendingReads = queueReadIntent(pendingReads, "*", false, globalSeen, state.readRowId);
     if (unreadChat && pushUnreadArgs(unreadChat)) pendingReads = queueReadIntent(pendingReads, unreadChat, true);
-    if ((explicitRead || (readPush === "thread" && (state.unreadCounts[readChat] ?? 0) > 0)) && readChat && readChat !== unreadChat && canDeleteChat(readChat)) pendingReads = queueReadIntent(pendingReads, readChat, false, seenTs);
+    if ((explicitRead || (readPush === "thread" && (state.unreadCounts[readChat] ?? 0) > 0)) && readChat && readChat !== unreadChat && canAddressChat(readChat)) pendingReads = queueReadIntent(pendingReads, readChat, false, seenTs);
   }
   if (JSON.stringify(pendingReads) !== JSON.stringify(state.pendingReads ?? {}) &&
       !saveState({ ...state, pendingReads })) {
     throw new Error("state write failed; read action was not queued");
   }
   const remoteReads = fetchReadSnapshot();
-  if (remoteReads) pendingReads = reconcileReadIntents(pendingReads, remoteReads);
+  if (remoteReads && !worker.busy) pendingReads = reconcileReadIntents(pendingReads, remoteReads);
   // On migration, seed the ledger all the way back to what the user last read.
   // Thereafter cover both new arrivals and every outstanding unread row. That
   // makes the ledger exact even if an unread message is deleted on the Mac.
@@ -2152,7 +2038,7 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
   }
   // Badge counts against readMark (what the user has seen); toasts fire against
   // watermark (what the collector has seen). See BlipState.
-  const readMark = markRead ? (highest <= now ? highest : now) : state.readMark;
+  const readMark = markRead && globalSeen ? (globalSeen <= now ? globalSeen : now) : state.readMark;
   // Opening one conversation clears only that thread's dot — marked with
   // THAT chat's newest ts, never the global max.
   // Under thread sync, confirmed Mac state replaces historical local marks.
@@ -2165,8 +2051,9 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
     ? Object.fromEntries(Object.entries(state.unreadSince ?? {}).filter(([chat]) => isGroupChat(chat)))
     : { ...state.unreadSince };
   if (markRead) {
+    for (const c of Object.keys(readMarks)) delete readMarks[c];
     for (const [c, ts] of Object.entries(chatMax)) {
-      readMarks[c] = ts > now ? ts : now;
+      if (!remoteReads && ts <= globalSeen) readMarks[c] = ts > now ? ts : now;
     }
     for (const c of Object.keys(unreadSince)) delete unreadSince[c];
   }
@@ -2292,18 +2179,21 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
       const reading = canonical === readChat && readChat !== unreadChat;
       // Compare to the visible snapshot BEFORE advancing any read mark. An
       // unseen inbound must keep its dot and must not be cleared on the Mac.
-      if (reading && readPush === "thread" && row.unread > 0 && seenTs && row.latest <= seenTs && canDeleteChat(readChat)) {
+      if (reading && readPush === "thread" && row.unread > 0 && seenTs && row.latest <= seenTs && canAddressChat(readChat)) {
         pendingReads = queueReadIntent(pendingReads, readChat, false, seenTs);
       }
       const intent = pendingReads[canonical] ?? pendingReads["*"];
       const localMark = readMarks[chat] || readMarks[canonical] || "";
-      if (markRead || (reading && seenTs && row.latest <= seenTs) ||
+      const globalRow = markRead ? state.readRowId : state.readAllRowId;
+      const coveredByAll = globalRow !== undefined && row.max_id !== undefined && row.max_id <= globalRow;
+      if ((markRead && coveredByAll) ||
+          ((readPush !== "thread" || isGroupChat(canonical)) && coveredByAll) || (reading && seenTs && row.latest <= seenTs) ||
           ((readPush !== "thread" || isGroupChat(canonical)) && localMark && row.latest <= localMark) ||
           (intent && !intent.unread && (!intent.seen || row.latest <= intent.seen))) {
         delete exactCounts[chat]; delete exactOldest[chat];
       }
     }
-  } else if (readPush === "thread" && readChat && canDeleteChat(readChat) && readChat !== unreadChat) {
+  } else if (readPush === "thread" && readChat && canAddressChat(readChat) && readChat !== unreadChat) {
     // Older/offline bridges still retain the transition until it is verified.
     const before = unreadCounts(msgs, state.readMark, state.readMarks, selfChats, state.unreadSince);
     if (seenTs && lastInboundTs(msgs, readChat) > seenTs) {
@@ -2320,7 +2210,7 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
     }
   }
   for (const [chat, intent] of Object.entries(pendingReads)) {
-    if (intent.unread) { exactCounts[chat] = Math.max(1, exactCounts[chat] ?? 0); exactOldest[chat] ||= unreadSince[chat] || now; }
+    if (!intent.action && intent.unread) { exactCounts[chat] = Math.max(1, exactCounts[chat] ?? 0); exactOldest[chat] ||= unreadSince[chat] || now; }
   }
   exactCounts = foldChatRecord(exactCounts, chatAliases, (a, b) => a + b);
   exactOldest = foldChatRecord(exactOldest, chatAliases, (a, b) => (a < b ? a : b));
@@ -2330,10 +2220,12 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
   // marks above do: a message arriving under a retired chat row is the same
   // conversation you are looking at.
   const readingNow = readChat ? [readChat, ...aliasesOf(chatAliases, readChat)] : [];
-  const toast = selectToasts(msgs, state.watermark, loadAllowlist(), state.toasted, readingNow);
+  const alertMuted = listed ? listed.filter(c => c.muted).flatMap(c => [c.id, ...(c.aliases ?? [])]) : state.alertMuted ?? [];
+  const toast = selectToasts(msgs, state.watermark, loadAllowlist(), state.toasted, readingNow)
+    .filter(t => !alertMuted.includes(t.chat));
   const failures = selectFailures(fetched.msgs, state.toasted, now);
-  const links = selectIncomingLinks(msgs, state.watermark, state.toasted, selfChats);
-  const codes = selectCodes(msgs, state.watermark, state.toasted, selfChats);
+  const links = selectIncomingLinks(msgs, state.watermark, state.toasted, selfChats).filter(t => !alertMuted.includes(t.chat));
+  const codes = selectCodes(msgs, state.watermark, state.toasted, selfChats).filter(t => !alertMuted.includes(t.chat));
   // Header/badge count conversations with a blue dot, not inbound rows.
   // Two chats with two unread messages each used to say "4 UNREAD".
   const unread = Object.values(exactCounts).filter((count) => count > 0).length;
@@ -2344,6 +2236,10 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
   // measured against — nothing would badge or toast until "tomorrow" (Astra B#4).
   const highestNow = highest <= now ? highest : now;
   const nextState: BlipState = {
+    alertMuted,
+    readAllRowId: markRead ? state.readRowId : state.readAllRowId,
+    readRowId: remoteReads && Object.values(remoteReads).every(r => r.max_id !== undefined)
+      ? Math.max(0, ...Object.values(remoteReads).map(r => r.max_id!)) : state.readRowId,
     pendingReads,
     watermark: highestNow,
     // First ever run: adopt the current high-water rather than reporting the
@@ -2363,25 +2259,11 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
   };
   const persisted = saveState(nextState);
 
-  // Actions are synchronous and serialized with the collector, never detached.
-  // Process one due intent per run so a failed chat cannot starve the rest.
-  let syncError = "";
-  if (persisted && readPush !== "off") {
-    const candidates = pendingReads["*"] ? [["*", pendingReads["*"]] as const] : Object.entries(pendingReads);
-    const due = candidates.filter(([, r]) => r.retryAt <= Date.now())
-      .sort((a, b) => a[1].retryAt - b[1].retryAt)[0];
-    if (due) {
-      const [chat, intent] = due;
-      const result = chat === "*" ? runReadAction(["--all"])
-        : runReadAction([intent.unread ? "--unread" : "--chat", chat,
-          ...(!intent.unread && intent.seen ? ["--through", intent.seen] : [])]);
-      if (result.ok) delete pendingReads[chat];
-      else {
-        pendingReads[chat] = retryReadIntent(intent, Date.now(), result.error);
-        syncError = result.error;
-      }
-      if (!saveState({ ...nextState, pendingReads })) syncError = "read acknowledgement could not be saved; will verify again";
-    }
+  // The mailbox worker cannot write collector state or delay message polling.
+  let syncError = worker.notice;
+  if (persisted) {
+    try { scheduleReadJob(HOME, pendingReads, worker.completed); }
+    catch { syncError = "Read worker could not start; will retry"; }
   }
   const remaining = Object.keys(pendingReads).length;
   const warning = !persisted
@@ -2421,27 +2303,14 @@ if (import.meta.main) {
   const seenTs = si >= 0 ? String(process.argv[si + 1] ?? "") : "";
   const ui = process.argv.indexOf("--mark-unread");
   let unreadChat = ui >= 0 ? String(process.argv[ui + 1] ?? "") : "";
-  const di = process.argv.indexOf("--delete-chat");
-  const deleteChat = di >= 0 ? String(process.argv[di + 1] ?? "") : "";
   const ai = process.argv.indexOf("--act");
   const act = ai >= 0 ? String(process.argv[ai + 1] ?? "") : "";
   const ti = process.argv.indexOf("--target");
   const actTarget = ti >= 0 ? String(process.argv[ti + 1] ?? "") : "";
   try {
-    let actionError = "";
-    if (deleteChat) {
-      const gone = deleteConversation(deleteChat);
-      if (!gone.ok) actionError = gone.error;
-    }
     if (act === "unread" && actTarget) unreadChat = unreadChat || actTarget;
     if (act === "read" && actTarget) readChat = readChat || actTarget;
-    if (act && actTarget && act !== "unread" && act !== "read") {
-      const did = conversationAct(act, actTarget);
-      if (!did.ok) actionError = did.error;
-    }
-    const out = collect(deep, markRead, readChat, seenTs, unreadChat, act === "read") as BlipOutput & { deleted?: boolean };
-    if (deleteChat) out.deleted = !actionError;
-    if (actionError) out.error = actionError;
+    const out = collect(deep, markRead, readChat, seenTs, unreadChat, act === "read", act, actTarget);
     console.log(JSON.stringify(out));
   } catch (e) {
     console.log(

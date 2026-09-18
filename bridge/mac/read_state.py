@@ -59,9 +59,9 @@ def read_state(con, predicate="", include_deleted=False):
         SELECT chat,
                SUM(CASE WHEN read_barriers=0 THEN 1 ELSE 0 END) AS unread,
                MIN(CASE WHEN read_barriers=0 THEN date END) AS oldest,
-               MAX(date) AS latest
+               MAX(date) AS latest, MAX(id) AS max_id
         FROM ranked GROUP BY chat
     """)
-    return [{"chat": r[0], "unread": int(r[1]), "oldest": r[2], "latest": r[3],
+    return [{"chat": r[0], "unread": int(r[1]), "oldest": r[2], "latest": r[3], "max_id": r[4],
              "aliases": [cid for cid, canon in aliases.items() if canon == r[0] and cid != r[0]]}
             for r in rows if valid_chat_id(r[0])]

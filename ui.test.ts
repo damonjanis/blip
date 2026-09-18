@@ -288,16 +288,12 @@ describe("QML safety invariants", () => {
     expect(nav).toContain("Qt.ShiftModifier");
   });
 
-  test("delete conversation asks first and only then calls the host", () => {
-    expect(panel).toContain('text: "Delete"');
-    expect(panel).toContain('objectName: "blipDeleteConfirm"');
-    expect(qmlFunction("confirmDelete")).toContain("hostWidget.deleteThread");
-    expect(qmlFunction("unwind")).toContain("pendingDelete");
-    expect(widget).toContain("function deleteThread");
-    expect(widget).toContain("--delete-chat");
+  test("Delete is excluded until Mac targeting is verified", () => {
+    expect(panel).not.toContain('text: "Delete"');
+    expect(widget).not.toContain("--delete-chat");
   });
 
-  test("the conversation menu matches Messages: pin, read/unread, alerts, delete", () => {
+  test("the conversation menu matches Messages: pin, read/unread, alerts", () => {
     expect(panel).toContain('text: root.contactContext && root.contactContext.pinned ? "Unpin" : "Pin"');
     expect(panel).toContain('text: "Mark as Unread"');
     expect(panel).toContain('text: "Mark as Read"');
@@ -1010,7 +1006,7 @@ describe("a multi-part send is pinned to the thread it started in", () => {
   });
 });
 
-// Poll no-op detection must follow optimistic reads, unreads and deletes too.
+// Poll no-op detection must follow optimistic reads and unreads too.
 // A cache assigned only by polls lets a stale result change the count without
 // updating the actual list, producing a badge with more entries than its tooltip.
 test("poll snapshots compare against the current rendered list", () => {

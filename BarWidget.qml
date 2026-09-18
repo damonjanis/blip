@@ -294,10 +294,10 @@ BarWidget {
   }
   property bool collectorReserved: false // a queued run owns the next event-loop turn
 
-  function refresh(deep, markRead, readChat, seen, unreadChat, deleteChat, act, actTarget) {
+  function refresh(deep, markRead, readChat, seen, unreadChat, act, actTarget) {
     var req = { deep: deep === true, markRead: markRead === true,
                 readChat: String(readChat || ""), seen: String(seen || ""),
-                unreadChat: String(unreadChat || ""), deleteChat: String(deleteChat || ""),
+                unreadChat: String(unreadChat || ""),
                 act: String(act || ""), actTarget: String(actTarget || "") }
     if (collector.running || collectorReserved) { enqueueRefresh(req); return }
     runRefresh(req)
@@ -310,9 +310,8 @@ BarWidget {
     if (req.deep) args.push("--deep")
     if (req.markRead) args.push("--mark-read")
     if (req.unreadChat) args.push("--mark-unread", req.unreadChat)
-    if (req.deleteChat) args.push("--delete-chat", req.deleteChat)
     if (req.act) { args.push("--act", req.act); if (req.actTarget) args.push("--target", req.actTarget) }
-    if (req.readChat !== "" && req.readChat !== req.unreadChat && req.readChat !== req.deleteChat) {
+    if (req.readChat !== "" && req.readChat !== req.unreadChat) {
       args.push("--read", req.readChat)
       if (req.seen !== "") args.push("--seen", req.seen)
     }
@@ -391,7 +390,7 @@ BarWidget {
     noteLocalRead(c, lastTs)
     threads = list
     unread = unreadChatCount(list)
-    refresh(true, false, c, lastTs, "", "", act || "", act ? c : "")
+    refresh(true, false, c, lastTs, "", act || "", act ? c : "")
   }
 
   function markThreadUnread(chat) {
@@ -422,14 +421,7 @@ BarWidget {
         return Object.assign({}, t, { muted: k === "mute" })
       })
     }
-    refresh(true, false, "", "", "", "", k, c)
-  }
-
-  function deleteThread(chat) {
-    var c = String(chat)
-    threads = threads.filter(function(t) { return String(t.chat) !== c })
-    unread = unreadChatCount(threads)
-    refresh(true, false, "", "", "", c)
+    refresh(true, false, "", "", "", k, c)
   }
 
   function markAllRead() {

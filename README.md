@@ -118,7 +118,7 @@ Linux side. If the Mac is asleep, the widget dims and says so.
 
 **Thread list**
 - contact photo (from the Mac's Contacts), a group's own photo from Messages when it has one, or initials · name, preview, time
-- **pinned conversations mirrored from Messages on the Mac**, kept in the same order at the top (read-only)
+- **pinned conversations mirrored from Messages on the Mac**, kept in the same order at the top
 - **blue dot** that stays until you open *that* conversation — iMessage semantics, not "I glanced at the list"
 - **mark as unread** — right-click a row, or `U` in the list; DMs also click Messages' own menu on the Mac so the phone can follow
 - groups titled the way Messages.app titles them: the group's name, else its members
@@ -766,13 +766,27 @@ for conversations outside the recent-message window. Confirmed local overrides
 are retired, allowing later Mac/iPhone changes to take effect. Both updated
 Mac tools require the sibling `read_state.py` module.
 
+Mac actions run in a separate durable worker, so a slow action does not stop
+polling. Linux requires `flock` (provided by util-linux on Omarchy). An unfinished
+Mark All Read is cancelled when new inbound rows arrive or a later per-thread
+read/unread gesture supersedes it. It never expands its original retry scope.
+The UI and SQLite checks cannot make a Messages menu click atomic with new
+arrivals; the bridge checks immediately before the click.
+
+Right-click a direct conversation to Pin/Unpin, Mark as Read/Unread, or Hide/Show
+Alerts. Hide Alerts also suppresses Blip's local notifications. Pin and alert
+changes are independent of `push_read`; that setting controls read state only.
+Group unread marks are local; pin and alert menu actions are currently DMs only.
+Delete is intentionally excluded pending reliable verification of the selected
+Mac conversation.
+
 `push_read` in `bridge.conf` takes three values, and the default surprises
 people: **`all`** (the default) pushes *only* on the mark-all gesture, so
 reading one conversation in Blip clears its dot here and leaves your iPhone's
 badge alone. **`thread`** also pushes each conversation you open — DMs only,
 since a group has no `imessage://` form — at the cost of bringing Messages to
 the front on the Mac, because aiming that menu at one conversation means
-opening it. **`off`** keeps the Mac out of it entirely. `qs ipc call
+opening it. **`off`** keeps read changes local. `qs ipc call
 nixfred.blip status` reports the live value as `read_push=`. Every push records
 its outcome in `~/.local/state/blip/push-read.log` (no message content), so
 "did that reach the Mac?" has an answer.

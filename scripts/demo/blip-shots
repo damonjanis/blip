@@ -124,7 +124,6 @@ ipc open "$CONV" >/dev/null;              shoot app 3.0
 ipc share https://oatlug.org >/dev/null;  shoot share-sheet 2.5
 
 ipc menu >/dev/null;                     shoot conversation-menu 1.0
-ipc confirm >/dev/null;                  shoot delete-confirmation 1.0
 
 if [[ $KEEP == 1 ]]; then
   echo "· window left up (pid $DEMO_PID) — kill it when you are done"

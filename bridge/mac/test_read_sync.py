@@ -195,6 +195,38 @@ class Actions(unittest.TestCase):
             self.assertEqual(self.tool.settle(3), 0)
 
 
+class GlobalReadGuard(unittest.TestCase):
+    def test_newer_same_second_row_prevents_any_global_click(self):
+        tool = load_tool('imsg-read')
+        with patch.object(sys, 'argv', ['imsg-read', '--all', '--through-row', '1']), \
+                patch.object(tool, 'ensure_messages', return_value=''), \
+                patch.object(tool, 'accessibility', return_value=''), \
+                patch.object(tool, 'unread_on_mac', return_value=1), \
+                patch.object(tool.sqlite3, 'connect'), \
+                patch.object(tool, 'read_state', return_value=[{'max_id': 2}]), \
+                patch.object(tool, 'click') as click, \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            tool.main()
+        self.assertEqual(caught.exception.code, 76)
+        click.assert_not_called()
+
+    def test_waking_messages_rechecks_before_global_click_and_restores_focus(self):
+        tool = load_tool('imsg-read')
+        with patch.object(sys, 'argv', ['imsg-read', '--all', '--through', '2026-09-01T10:00:00Z']), \
+                patch.object(tool, 'ensure_messages', return_value=''), \
+                patch.object(tool, 'accessibility', return_value=''), \
+                patch.object(tool, 'unread_on_mac', return_value=1), \
+                patch.object(tool, 'newer_than_seen', side_effect=[False, True]), \
+                patch.object(tool, 'click', return_value=(False, '')) as click, \
+                patch.object(tool, 'wake_messages', return_value='Previous'), \
+                patch.object(tool, 'restore_front') as restore, \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            tool.main()
+        self.assertEqual(caught.exception.code, 76)
+        self.assertEqual(click.call_count, 1)
+        restore.assert_called_once_with('Previous')
+
+
 class MenuVerification(unittest.TestCase):
     def setUp(self):
         self.tool = load_tool('imsg-read')
@@ -239,17 +271,6 @@ class MenuVerification(unittest.TestCase):
         self.assertEqual(events, ['capture', 'select'])
         restore.assert_called_once_with('Previous')
 
-    def test_unverified_delete_is_not_acknowledged(self):
-        with patch.object(self.tool, 'chat_present', return_value=None), \
-                patch.object(self.tool, 'select_chat', return_value=''), \
-                patch.object(self.tool, 'wake_messages', return_value='Previous'), \
-                patch.object(self.tool, 'restore_front'), \
-                patch.object(self.tool, 'click', return_value=(True, '')), \
-                patch.object(self.tool, 'confirm_delete_sheet', return_value=(True, '')), \
-                patch.object(self.tool.time, 'sleep'), \
-                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
-            self.tool.delete_conversation('+15551234567')
-        self.assertEqual(caught.exception.code, 75)
 
 
 if __name__ == '__main__':

@@ -61,7 +61,7 @@ FocusScope {
   readonly property color dim: appearance.muted
   /** An editor owns the keyboard — the host's key catcher must stand down. */
   readonly property bool editorActive:
-    messageMenu.visible || contactMenu.visible || pendingDelete !== null || contactReview.opened || composeField.activeFocus || searchField.activeFocus || newField.activeFocus || bubbleFocused
+    messageMenu.visible || contactMenu.visible || contactReview.opened || composeField.activeFocus || searchField.activeFocus || newField.activeFocus || bubbleFocused
   readonly property alias composeEditor: composeField
   readonly property real contentHeightHint: listContent.implicitHeight
   /** The view wants keyboard navigation focus back (list mode). */
@@ -721,20 +721,6 @@ FocusScope {
     if (isShowing(t) || (inThread && String(active.chat) === String(t.chat))) back()
     root.hostWidget.markThreadUnread(String(t.chat))
   }
-  property var pendingDelete: null
-  function requestDelete(t) {
-    if (!t) return
-    pendingDelete = t
-  }
-  function confirmDelete() {
-    var t = pendingDelete
-    pendingDelete = null
-    if (!t || !root.hostWidget) return
-    if (isShowing(t) || (inThread && String(active.chat) === String(t.chat))) back()
-    root.hostWidget.deleteThread(String(t.chat))
-  }
-  function cancelDelete() { pendingDelete = null }
-
   /** Chip icon for an attachment's mime type. */
   function attachmentIcon(mime) {
     var m = String(mime || "")
@@ -2163,7 +2149,6 @@ FocusScope {
   /** Esc semantics for a host without a PanelKeyCatcher (the window): true if
    *  something was unwound, false if the host should close. */
   function unwind() {
-    if (pendingDelete) { cancelDelete(); return true }
     if (contactReview.opened) { contactReview.back(); return true }
     if (shareUrl !== "") { closeShare(); return true }
     if (catchEscape()) return true
@@ -3997,88 +3982,6 @@ FocusScope {
       onTriggered: {
         var t = root.contactContext
         if (t && root.hostWidget) root.hostWidget.conversationAct(t.muted ? "unmute" : "mute", t.chat)
-      }
-    }
-    MenuSeparator {}
-    MenuItem {
-      text: "Delete"
-      icon.source: root.menuIcon("trash")
-      enabled: root.isDmChat(root.contactContext)
-      onTriggered: if (root.contactContext) root.requestDelete(root.contactContext)
-    }
-  }
-  Rectangle {
-    objectName: "blipDeleteConfirm"
-    visible: root.pendingDelete !== null
-    z: 1100
-    anchors.fill: parent
-    color: Qt.rgba(0, 0, 0, 0.45)
-    TapHandler { onTapped: root.cancelDelete() }
-    Rectangle {
-      anchors.centerIn: parent
-      width: Math.min(parent.width - Style.space(32), Style.space(320))
-      implicitHeight: delCol.implicitHeight + Style.space(24)
-      radius: Style.cornerRadius
-      color: Color.background
-      border.width: 1
-      border.color: root.dim
-      TapHandler { } // swallow
-      ColumnLayout {
-        id: delCol
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
-        anchors.margins: Style.space(16)
-        spacing: Style.space(12)
-        Text {
-          Layout.fillWidth: true
-          text: "Delete this conversation?"
-          textFormat: Text.PlainText
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: root.fontBody
-          font.bold: true
-          wrapMode: Text.WordWrap
-        }
-        Text {
-          Layout.fillWidth: true
-          text: "It is removed from Messages on the Mac and this computer. For about 30 days you can recover it from Recently Deleted on the Mac or iPhone."
-          textFormat: Text.PlainText
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: root.fontCaption
-          wrapMode: Text.WordWrap
-        }
-        RowLayout {
-          Layout.fillWidth: true
-          spacing: Style.space(8)
-          Item { Layout.fillWidth: true }
-          Text {
-            text: "Cancel"
-            textFormat: Text.PlainText
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: root.fontBodySmall
-            TapHandler { onTapped: root.cancelDelete() }
-          }
-          Rectangle {
-            implicitWidth: delBtn.implicitWidth + Style.space(16)
-            implicitHeight: delBtn.implicitHeight + Style.space(10)
-            radius: Style.cornerRadius
-            color: root.urgent
-            Text {
-              id: delBtn
-              anchors.centerIn: parent
-              text: "Delete"
-              textFormat: Text.PlainText
-              color: "#ffffff"
-              font.family: root.fontFamily
-              font.pixelSize: root.fontBodySmall
-              font.bold: true
-            }
-            TapHandler { onTapped: root.confirmDelete() }
-          }
-        }
       }
     }
   }

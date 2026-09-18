@@ -1,154 +1,75 @@
 # Read/unread sync and conversation actions: readiness review
 
-Review date: 2026-09-17. Base: upstream `b5cafc2ed19e9adda7625b03c16328d5dc8b91ac`.
-Branch: `port/read-sync-and-actions`.
+Reviewed 2026-09-18 against upstream `313326e` (including merged PRs #101 and
+#102). Author review, automated regressions and synthetic UI inspection.
 
-**Decision: port complete; hold the remaining changes from release and additional PRs.**
-The combined candidate passes automated tests, but the findings below prevent
-calling it ready to ship. This is a separate review pass by the author, not an
-independent maintainer review or a fresh live-macOS acceptance test.
+**Decision: ready for upstream review with Delete excluded.** The four blockers
+from the previous candidate are resolved or removed from scope. This is not a
+claim of complete macOS/iPhone parity or fresh live-macOS acceptance testing.
 
-## What was ported
+## Resolution of the blockers
 
-- Conversation menu: pin/unpin, read/unread, hide/show alerts, delete with a
-  confirmation dialog, icons, and the unread keyboard shortcut.
-- Durable pending read actions, retries, metadata-only Mac read snapshots,
-  alias reconciliation, reaction activity timestamps, older unread threads,
-  ordered gestures, faster fallback polling, and visible failures.
-- Conversation-based badge totals, local group unread behavior, bridge
-  installation changes, tests, and documentation.
+| Previous finding | Resolution | Evidence |
+| --- | --- | --- |
+| A global retry could clear newer inbound messages | Capture the prior complete snapshot's maximum inbound row id and timestamp. Cancel on newer metadata, including same-second rows. The Mac rechecks immediately before clicking and again after waking Messages. Stale requests return a terminal cancellation result instead of retrying. | Offline/same-second/newer-arrival collector tests; Mac guard tests |
+| Failed global actions starved later per-chat gestures | A later per-chat gesture supersedes the pending global intent. In-flight work completes before its successor; stale completions cannot acknowledge the successor. | Failed-global/later-read and in-flight read/unread tests |
+| Mac actions blocked the collector | `read-worker.ts` uses a durable single-slot mailbox and a separate flock-protected process. The collector alone owns state.json. Results carry job and intent ids; failure acknowledgement applies once. Pin/alert actions use the same worker. | Slow-action/concurrent-polling tests; stale-result and repeated-ack tests |
+| Delete lacked verified targeting | Removed the Delete menu, confirmation, collector command and Mac implementation from this submission. | UI absence assertion and source review |
 
-The integration includes the substance of submitted PRs #101 and #102. Before
-extracting more PRs, rebase on their merged versions (or explicitly account for
-the dependencies) to avoid submitting their fixes twice. Nothing in this branch
-has been deployed to the installed plugin or the Mac.
+A Mark All Read does not discard unrelated pending pin/alert edits. Repeated
+mark-all gestures in the same second accept a newer row boundary. An old
+unbounded request cannot prevent a valid due request from dispatching.
 
-Upstream Send Later behavior, message/link context actions, Review contact,
-and all three Mark All Read entry points (header, A shortcut, bar right-click)
-are retained. The prior removal of Mark All Read is deliberately not ported.
+## Additional corrections
 
-## Findings that block release
+- Preserve upstream Send Later, prefer_imessage and bin_dir behavior, bounded
+  catch-up, contact review, message/link menus and all Mark All Read controls.
+- Preserve local group unread overrides across complete snapshots.
+- Require verification for pin/mute; skip already-satisfied actions and restore
+  the app that was frontmost before selection.
+- Hide Alerts suppresses local Blip notifications while leaving the conversation
+  visible. Pin and alert metadata refresh after worker completion.
+- Remove superseded detached-push helpers and tests of those unused paths.
+- Preserve the original Qt badge regressions and add unread suppression coverage.
+- Keep bodies out of state, worker files and argv. Mailbox files contain only
+  action metadata and bounded status, with a private parent and atomic writes.
 
-### P1: a queued Mark All Read has no original-message boundary
+## Validation
 
-`read-sync.ts` (`queueReadIntent`, `reconcileReadIntents`) retains the `*` intent
-until every current unread is clear. `collector.ts` sends `--all` when that
-intent becomes due. The per-chat `--through` protection is not used for it.
+- Full Bun suite: **623 passed**.
+- Mac Python suite: **120 passed**; synthetic SQLite and mocked menu calls.
+- Qt: **5 scenarios passed** (plus setup/cleanup), including the original badge
+  regressions, unchanged-model identity and optimistic read/unread suppression.
+- Generated ReadSync.mjs matches its TypeScript build.
+- Python compile, QML parsing, bash syntax, ShellCheck 0.11.0 and whitespace
+  checks pass.
+- Inspected the [synthetic conversation menu](review-assets/conversation-menu.png).
+  No Delete option; contact review, pin, unread and alerts remain visible.
+  Demo log has no QML errors; it has an unrelated host-portal registration warning.
+- Synthetic in-memory read-state benchmark: 100,000 inbound rows across 100
+  conversations in approximately 0.17 seconds on the development machine.
+  This is not a production Mac performance measurement.
 
-Reproduction: queue Mark All Read while offline or make its first attempt fail;
-a new inbound arrives; reconnect/retry. The eventual `--all` includes the new
-message, even though it was not present when the user clicked. A pure-function
-probe confirms the intent remains queued with `seen: ""` after a newer unread
-snapshot; the CLI dispatch path then unconditionally chooses `--all`.
+## Remaining limits for the maintainer
 
-Acceptance: bind the action to the original scope/time, or cancel it when
-newer activity makes a global click unsafe. Add a process-level regression
-covering an offline click, a newer inbound, and reconnection. Include groups
-and aliases; do not silently trade this for clearing an unrelated thread.
+- Messages UI automation cannot make a SQLite check and a menu click atomic.
+  A message can arrive after the final guard; selection can be affected by a
+  person using the Mac. Post-action database verification detects failures but
+  cannot make that interaction transactional. The existing upstream read-push
+  integration has the same selection dependency; Delete remains excluded.
+- Pin, alert and per-thread Mac read/unread actions support DMs only. Group
+  unread remains local; global read still covers groups.
+- Read pushes remain `all` by default; `thread` remains opt-in. Pin/alert menu
+  requests are independent of read-push policy and can briefly activate Messages.
+- Newer global activity conservatively cancels the whole global retry. Users
+  can deliberately choose Mark All Read again after reviewing the new state.
+- The badge now counts unread conversations instead of individual inbound rows;
+  this is an explicit product change for maintainer review, not part of #101.
+- Linux needs flock (util-linux). Install the new TypeScript worker/module and
+  update both Mac tools with their sibling read_state.py together.
+- No real conversation was opened, modified, deleted or messaged for these tests.
+  Fresh live-macOS menu/iCloud acceptance is not claimed. Test the supported Mac
+  versions and a large real metadata-only database before a broad release.
 
-### P1: destructive targeting is not verified before the click
-
-`bridge/mac/imsg-read` (`select_chat`, `delete_conversation`) treats a successful
-`open imessage://...` plus a fixed delay as proof of which conversation is
-selected. It does not read back the selected identity. `chat_present` checks a
-chat row's existence, not its active-versus-Recoverable status. The initial
-presence check does not gate selection or deletion.
-
-A selection failure that still returns success can act on another conversation.
-A post-click failure cannot undo that action. Conversely, a retained chat row
-can make a successful deletion look like failure. These are code-review risks;
-we did not attempt destructive actions on real data to reproduce them.
-
-Acceptance: verify the selected target before any destructive action and verify
-active/recoverable conversation state afterward. Use disposable, explicitly
-approved test conversations on a Mac. If identity verification cannot be made
-reliable, omit Delete from the first menu PR. Pin/mute/read also need wrong-target
-and delayed-selection acceptance coverage.
-
-### P2: Mac actions block the only collector
-
-`collector.ts` (`runReadAction`) uses synchronous execution with a 180-second
-timeout inside `collect`. The widget queues subsequent refreshes while that
-collector is running. Pin/mute/delete use separate synchronous 60-second calls.
-An Accessibility prompt, a stalled SSH call, or lock contention therefore delays
-normal read-state updates and notifications as well as the action itself.
-
-Acceptance: separate bounded action processing from polling while preserving a
-single state owner, durable intent, ordering, and acknowledgement. A slow-action
-integration test should demonstrate that unrelated incoming-message polling
-continues. Merely reducing the timeout risks truncating macOS consent prompts.
-
-### P2: persistent Mark All failure can starve unrelated actions
-
-`collector.ts` selects only `pendingReads["*"]` while it exists. Even when its
-retry deadline is in the future, no per-chat candidate runs. This preserves
-ordering but indefinitely blocks later explicit per-chat gestures if the global
-action cannot succeed.
-
-Acceptance: define cancellation/supersession for a failed global operation and
-prove a later explicit gesture can make progress without being undone by an
-older retry. Coordinate this with the boundary fix above.
-
-## Findings fixed during this port/review
-
-- Resolved merge conflicts without losing scheduled-message exclusion from
-  newest-message selection and rendered read boundaries.
-- Restored Mark All Read and the upstream Review contact menu item.
-- Added the conversation menu/delete dialog to the keyboard-focus guard.
-- Pin/mute/delete no longer acknowledge unavailable verification as success.
-  Flag settling retries transient unavailable readings within its bounded wait.
-- Already-satisfied pin/mute actions do not select or click again. Pin/mute
-  capture the prior foreground app before selecting a conversation.
-- Complete Mac snapshots preserve local-only group unread overrides. A CLI
-  regression proves the override survives another poll and clears on mark-all.
-- Demo packaging includes the new icons and supplies the avatar cache contract;
-  it can capture menus and confirmation without operating the real bridge.
-- Included #102's final bounded settling behavior and regression tests, rather
-  than the earlier local variant that stopped on a transient database failure.
-
-## Validation and limits
-
-| Check | Result |
-| --- | --- |
-| Full Bun suite | 600 passed, 0 failed |
-| Python Mac bridge discovery | 119 passed |
-| Headless Qt read-state tests | 3 scenarios passed, plus setup/cleanup |
-| Generated `ReadSync.mjs` | Rebuilt output matches committed module |
-| Python compile | imsg, imsg-read, read_state.py pass |
-| QML parser | BarWidget.qml and BlipView.qml parse with qmlformat |
-| Shell syntax | modified demo and Mac installer pass bash -n |
-| Whitespace | git diff --check passes |
-| Visual review | synthetic menu and confirmation inspected; icons and labels present |
-| Shellcheck | Not run locally: executable unavailable; CI retains its check |
-| GitHub CI for this candidate | Not run; no candidate PR published |
-| Live Mac/iPhone acceptance | Not performed for this port |
-
-The demo log has no QML errors after correcting its host contract. It reports a
-host-portal registration warning, unrelated to the conversation renderer. The
-screenshots are entirely invented fixture conversations:
-
-- [Conversation menu](review-assets/conversation-menu.png)
-- [Delete confirmation](review-assets/delete-confirmation.png)
-
-Linux synthetic tests prove local state-machine behavior, not that every macOS
-version exposes the expected menu or that iCloud completes a remote mutation.
-The new read-state query also needs performance measurements on a large real
-metadata-only database before accepting a ten-second full-snapshot cadence.
-
-## Cleanup and product decisions before PR extraction
-
-- Remove superseded `pushRead`, `pushReadCommand`, `pushReadArgs`, and
-  `markUnreadOnMac` paths and replace their legacy tests with tests of the active
-  durable runner. Keeping tests of unused code inflates apparent coverage.
-- Separate sync reliability from menu actions. Consider excluding Delete until
-  its target-verification finding is resolved.
-- Obtain maintainer agreement on counting conversations instead of messages;
-  this is a product behavior change, separate from #101's consistency bug.
-- Reconcile documentation around muted conversations, local-only group actions,
-  read-state heuristics, and the remaining Mac UI limitations.
-- Tighten the QML test harness and reduce broad text-shape assertions. Retain
-  runtime and process-level tests for the behavior each PR claims to fix.
-
-Recommended next PR order after addressing the findings: durable sync/read-state
-reconciliation, then conversation menu actions. Keep the two already-submitted
-small fixes independent.
+The installed plugin and Mac bridge were not changed. The code and this review
+are provided for upstream assessment; CI status belongs to the resulting PR.

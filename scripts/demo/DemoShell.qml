@@ -34,11 +34,10 @@ ShellRoot {
     property string timeFormat: Quickshell.env("BLIP_DEMO_TIME_FORMAT") || "h:mm AP"
     property string dateFormat: Quickshell.env("BLIP_DEMO_DATE_FORMAT") || "MMM d"
     property string dateFormatWithYear: Quickshell.env("BLIP_DEMO_DATE_FORMAT_WITH_YEAR") || "MMM d, yyyy"
-    function refresh(deep, markRead, readChat, seen, unreadChat, deleteChat) { collector.reload() }
+    function refresh(deep, markRead, readChat, seen, unreadChat, act, actTarget) { collector.reload() }
     function markAllRead() { }
     function markThreadRead(chat) { }
     function markThreadUnread(chat) { }
-    function deleteThread(chat) { }
     function conversationAct(kind, chat) { }
     function showApp() { }
   }
@@ -126,7 +125,6 @@ ShellRoot {
       function share(url: string): string { return view.shareLink(url) }
       function threads(): string { return String(host.threads.length) }
       function menu(): string { view.closeShare(); view.openConversationMenu(host.threads[0]); return "menu" }
-      function confirm(): string { view.closeConversationMenu(); view.requestDelete(host.threads[0]); return "confirm" }
     }
   }
 }
