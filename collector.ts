@@ -1859,6 +1859,18 @@ export function applyPins(threads: Thread[], pins: Record<string, number | null>
     .sort(compareThreads);
 }
 
+/** Re-apply the cached Hide Alerts set to a shallow poll's threads.
+ *  buildThreads knows nothing about Messages' flag, so without this a muted
+ *  conversation came back `muted: false` on every shallow poll and the menu
+ *  offered "Hide Alerts" for a chat whose alerts were already off. */
+export function applyAlertsOff(threads: Thread[], alertsOff: string[]): Thread[] {
+  const quiet = new Set(alertsOff);
+  return threads.map((t) => {
+    const muted = quiet.has(t.chat);
+    return t.muted === muted ? t : { ...t, muted };
+  });
+}
+
 /** Fold threads carrying an alias id into the canonical thread. */
 export function foldThreadAliases(threads: Thread[], aliases: Record<string, string>): Thread[] {
   if (Object.keys(aliases).length === 0) return threads;
@@ -2333,12 +2345,14 @@ export function collect(deep: boolean, markRead = false, readChat = "", seenTs =
   exactCounts = foldChatRecord(exactCounts, chatAliases, (a, b) => a + b);
   exactOldest = foldChatRecord(exactOldest, chatAliases, (a, b) => (a < b ? a : b));
   const foldedWindow = foldThreadAliases(windowThreads, chatAliases).map(t => ({ ...t, unread: exactCounts[t.chat] ?? 0 }));
-  const threads = chats ? mergeChats(foldedWindow, chats, groups, exactCounts) : applyPins(foldedWindow, pins);
+  const alertsOff = messagesMutedIds(listed, state.alertsOff ?? []);
+  const threads = chats
+    ? mergeChats(foldedWindow, chats, groups, exactCounts)
+    : applyAlertsOff(applyPins(foldedWindow, pins), alertsOff);
   // The conversation on screen covers its alias rows, exactly as the read
   // marks above do: a message arriving under a retired chat row is the same
   // conversation you are looking at.
   const readingNow = readChat ? [readChat, ...aliasesOf(chatAliases, readChat)] : [];
-  const alertsOff = messagesMutedIds(listed, state.alertsOff ?? []);
   const quiet = new Set(alertsOff);
   const toast = selectToasts(msgs, state.watermark, loadAllowlist(), state.toasted, readingNow)
     .filter((t) => !quiet.has(t.chat));

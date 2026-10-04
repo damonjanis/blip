@@ -12,7 +12,11 @@
 - **Conversation menu.** Right-click is Pin / Unpin, Mark as Unread or Mark as
   Read, and Hide Alerts / Show Alerts. Pin, alerts, and read-state click
   Messages' own menu (DMs). Hide Alerts also stops Blip's own toasts for that
-  chat; the conversation stays in the list. Mark as Unread, pin, and alerts stay on direct
+  chat; the conversation stays in the list. Pin and alerts count as done only
+  when Messages' own records confirm them across the whole conversation (both
+  handles of a merged DM); an unreadable record is a failure, never success.
+  Opening a DM to pin or mute it puts back an unread that opening it read, and
+  focus returns to the app you were in. Mark as Unread, pin, and alerts stay on direct
   messages. A group read still reaches the Mac through
   Messages' groupid link. Mark-all-read stays on the list, the `a` key, and
   the bar right-click.

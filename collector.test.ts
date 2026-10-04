@@ -55,6 +55,7 @@ import {
   markUnreadOnMac,
   conversationAct,
   messagesMutedIds,
+  applyAlertsOff,
   type ImsgMessage,
   type ChatInfo,
 } from "./collector";
@@ -2221,4 +2222,41 @@ test("Hide Alerts ids survive a shallow poll and clear when the list says so", (
   expect(messagesMutedIds(null, ["+15550100001"])).toEqual(["+15550100001"]);
   expect(messagesMutedIds([row], [])).toEqual(["+15550100001", "pat@example.com"]);
   expect(messagesMutedIds([{ ...row, muted: false }], ["+15550100001"])).toEqual([]);
+});
+
+describe("Hide Alerts across deep and shallow polls", () => {
+  const dm = "+15550100001";
+  const deepRow = { id: dm, aliases: ["pat@example.com"], muted: true } as ChatInfo;
+
+  test("a muted thread stays muted when a shallow poll rebuilds it", () => {
+    // Deep run: the chat list says Hide Alerts is on.
+    const cached = messagesMutedIds([deepRow], []);
+    // Shallow run: no chat list, threads come straight from buildThreads.
+    const [shallow] = buildThreads([msg({ chat: dm, handle: dm, text: "hi" })], "");
+    expect(shallow!.muted).toBe(false);
+    const [rendered] = applyAlertsOff([shallow!], messagesMutedIds(null, cached));
+    expect(rendered!.muted).toBe(true);
+  });
+
+  test("Show Alerts on the Mac unmutes the row at the next chat list", () => {
+    const cached = messagesMutedIds([{ ...deepRow, muted: false }], [dm]);
+    const [shallow] = buildThreads([msg({ chat: dm, handle: dm, text: "hi" })], "");
+    expect(applyAlertsOff([{ ...shallow!, muted: true }], cached)[0]!.muted).toBe(false);
+  });
+
+  test("unchanged rows are reused so the widget can skip identical lists", () => {
+    const [t] = buildThreads([msg({ chat: dm, handle: dm, text: "hi" })], "");
+    const list = [t!];
+    expect(applyAlertsOff(list, [])[0]).toBe(t);
+  });
+});
+
+test("conversationAct surfaces the Mac's reason when a write cannot be verified", () => {
+  const runner = () => ({
+    status: 75, stdout: "",
+    stderr: "imsg-read: Unpin was clicked but Messages' records cannot confirm the conversation is unpinned\n",
+  }) as never;
+  const r = conversationAct("unpin", "+15550100011", "/home/u", runner);
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("cannot confirm");
 });
