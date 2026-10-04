@@ -685,6 +685,32 @@ def _app_card_text(row) -> str | None:
     return None
 
 
+def ordered_pins(data) -> list[set[str]] | None:
+    """``pD.pP`` with each group's ``pZ`` alias folded in, or None when the
+    plist is not in that layout. An EMPTY list is a real answer: Messages'
+    pin list, read in full, with nothing in it. imsg-read verifies Unpin
+    against exactly this, so it must never mistake "unreadable" for "none".
+    """
+    def alias_set(value) -> set[str]:
+        return {value.strip()} if isinstance(value, str) and value.strip() else set()
+
+    pd = data.get("pD") if isinstance(data, dict) else None
+    ordered = pd.get("pP") if isinstance(pd, dict) else None
+    if not isinstance(ordered, (list, tuple)):
+        return None
+    aliases = pd.get("pZ") if isinstance(pd.get("pZ"), dict) else {}
+    out: list[set[str]] = []
+    for pin_id in ordered:
+        ids = alias_set(pin_id)
+        if not ids:
+            continue
+        extra = aliases.get(pin_id)
+        if isinstance(extra, dict):
+            ids |= alias_set(extra.get("o"))
+        out.append(ids)
+    return out
+
+
 def pinned_chat_identifiers() -> list[set[str]]:
     """Ordered pins from Messages' pinning preferences, one alias set each.
 
@@ -697,9 +723,6 @@ def pinned_chat_identifiers() -> list[set[str]]:
     missing the flatten is the fallback, so an unknown layout still yields
     something rather than nothing.
     """
-    def alias_set(value) -> set[str]:
-        return {value.strip()} if isinstance(value, str) and value.strip() else set()
-
     def flatten(item, out: list[set[str]], seen: set[str]) -> None:
         if isinstance(item, str):
             item = item.strip()
@@ -719,21 +742,9 @@ def pinned_chat_identifiers() -> list[set[str]]:
                 data = plistlib.load(f)
         except (OSError, plistlib.InvalidFileException, ValueError, TypeError):
             continue
-        pd = data.get("pD") if isinstance(data, dict) else None
-        ordered = pd.get("pP") if isinstance(pd, dict) else None
-        if isinstance(ordered, (list, tuple)):
-            aliases = pd.get("pZ") if isinstance(pd.get("pZ"), dict) else {}
-            out: list[set[str]] = []
-            for pin_id in ordered:
-                ids = alias_set(pin_id)
-                if not ids:
-                    continue
-                extra = aliases.get(pin_id)
-                if isinstance(extra, dict):
-                    ids |= alias_set(extra.get("o"))
-                out.append(ids)
-            if out:
-                return out
+        out = ordered_pins(data)
+        if out:
+            return out
         flat: list[set[str]] = []
         flatten(data, flat, set())
         if flat:
@@ -1346,15 +1357,34 @@ def cmd_contacts(con, args):
         print(f"{fmt_ts_local(r['last_date'])}  {r['n']:>6}  {r['service']:>8}  {r['handle']}{suffix}")
 
 
-def _chat_muted(blob) -> bool:
-    """Hide Alerts is chat.properties.ignoreAlertsFlag."""
+def alerts_flag(blob) -> bool | None:
+    """Hide Alerts is chat.properties.ignoreAlertsFlag. A chat Messages never
+    configured has no properties at all, which is "alerts on". None means the
+    blob is there but is not a plist dictionary: unknown, never "off"."""
     if not blob:
         return False
     try:
         props = plistlib.loads(blob)
     except (plistlib.InvalidFileException, ValueError, TypeError, OSError):
-        return False
-    return bool(props.get("ignoreAlertsFlag")) if isinstance(props, dict) else False
+        return None
+    return bool(props.get("ignoreAlertsFlag")) if isinstance(props, dict) else None
+
+
+def muted_conversations(con, clusters: dict) -> set[str]:
+    """Canonical chat ids whose conversation has Hide Alerts on ANY of its rows.
+
+    A merged DM (phone + email) and a re-keyed group keep several chat rows,
+    and the flag lands on whichever row Messages had selected. imsg-read
+    verifies Hide/Show Alerts over the same cluster, so the list and the
+    write agree on what "muted" means. Every row is read, not the sidebar
+    LIMIT, so a quiet alias still counts."""
+    if "properties" not in {row[1] for row in con.execute("PRAGMA table_info(chat)")}:
+        return set()
+    out = set()
+    for cid, blob in con.execute("SELECT chat_identifier, properties FROM chat"):
+        if cid and alerts_flag(blob) is True:
+            out.add(clusters.get(cid, cid))
+    return out
 
 
 def conversation_window(rows, limit, read_rows):
@@ -1372,14 +1402,13 @@ def cmd_chats(con, args):
     # original_group_id is absent on older chat.db schemas; probe once.
     chat_cols = {row[1] for row in con.execute("PRAGMA table_info(chat)")}
     orig_col = "c.original_group_id" if "original_group_id" in chat_cols else "NULL"
-    properties_col = "c.properties" if "properties" in chat_cols else "NULL"
     filt = chat_filter_sql(con, args, already_where=False)
     pending = pending_schedule_sql(con)
     rows = con.execute(
         f"""
         SELECT c.ROWID AS cid, c.chat_identifier, c.guid, c.group_id,
                {orig_col} AS original_group_id, c.display_name, c.room_name, c.style,
-               c.service_name, {properties_col} AS properties,
+               c.service_name,
                COALESCE(MAX(CASE WHEN {pending} THEN NULL ELSE m.date END), MAX(m.date)) AS last_date,
                COUNT(m.ROWID) AS n
         FROM chat c
@@ -1404,6 +1433,7 @@ def cmd_chats(con, args):
         # (phone + email sharing group_id) is the same shape.
         clusters = _group_cluster_map(con)
         pin_candidates = _cluster_pin_candidates(con, clusters)
+        muted = muted_conversations(con, clusters)
         merged_counts: dict = {}
         pin_orders: dict[str, int] = {}
         for r in rows:
@@ -1518,7 +1548,7 @@ def cmd_chats(con, args):
                 "pinned": pin_order is not None,
                 "pin_order": pin_order,
                 "pin_name": pin_name or None,
-                "muted": _chat_muted(r["properties"]),
+                "muted": clusters.get(chat_id, chat_id) in muted,
                 # Other chat rows of this same conversation. A client must fold
                 # any thread carrying one of these onto this id.
                 "aliases": [c for c, k in clusters.items()

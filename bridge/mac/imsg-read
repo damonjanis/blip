@@ -56,13 +56,6 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from read_state import read_state
 
 MENU = 'menu 1 of menu bar item "Conversation" of menu bar 1'
-PINNING_PLIST_PATHS = (
-    os.path.expanduser("~/Library/Preferences/com.apple.messages.pinning.plist"),
-    os.path.expanduser(
-        "~/Library/Containers/com.apple.MobileSMS/Data/Library/Preferences/"
-        "com.apple.messages.pinning.plist"
-    ),
-)
 TIMEOUT = 150   # the first System Events call can be a consent prompt; give it the ~2 minutes macOS gives it (Astra C#8)
 
 
@@ -304,58 +297,172 @@ def click(item: str) -> tuple[bool, str]:
     return (code == 0), ("" if code == 0 else out)
 
 
+GROUP_ID = re.compile(r"chat[0-9]{1,40}|[a-fA-F0-9]{32}")
+
+
+def open_db():
+    con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
+    # imsg's cluster queries read their columns by name.
+    con.row_factory = sqlite3.Row
+    return con
+
+
 def chat_muted(handle: str) -> Optional[bool]:
+    """Whether Hide Alerts is on for this conversation; None when unknown.
+
+    Scoped to the conversation cluster the way `imsg chats` reports it: muted
+    when ANY of its rows carries the flag, unmuted only when every row was
+    read and none does. A missing conversation or a properties blob that is
+    not a plist dictionary is unknown, never "alerts on" - otherwise a
+    failed Show Alerts could be acknowledged as done."""
     try:
-        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
+        con = open_db()
         try:
-            row = con.execute(
-                "SELECT properties FROM chat WHERE chat_identifier = ?", (handle,)
-            ).fetchone()
+            mod = imsg_module()
+            if "properties" not in {row[1] for row in con.execute("PRAGMA table_info(chat)")}:
+                return None
+            ids = sorted(set(mod.chat_cluster_ids(con, handle)) | {handle})
+            rows = con.execute(
+                f"SELECT properties FROM chat WHERE chat_identifier IN ({','.join('?' * len(ids))})",
+                ids).fetchall()
         finally:
             con.close()
     except Exception:
         return None
-    if not row or row[0] is None:
-        return False
-    try:
-        props = plistlib.loads(row[0])
-    except Exception:
-        return False
-    return bool(props.get("ignoreAlertsFlag")) if isinstance(props, dict) else False
+    if not rows:
+        return None
+    flags = [mod.alerts_flag(row["properties"]) for row in rows]
+    if True in flags:
+        return True
+    return None if None in flags else False
 
 
-def chat_pinned(handle: str) -> bool:
-    needle = str(handle or "").strip().lower()
-    if not needle:
-        return False
-    for path in PINNING_PLIST_PATHS:
+def pin_list():
+    """Messages' ordered pins (one alias set each), or None when no copy of
+    the pin list can be read in the layout `imsg` understands.
+
+    Same precedence as `imsg`'s reader: the first file with pins wins. An
+    empty list means "read, and nothing is pinned", which is what a verified
+    Unpin of the last pin looks like. `imsg` falls back to flattening every
+    string of an unknown layout; a verification cannot, because a stale
+    alias anywhere in the file would then pass for a pin."""
+    mod = imsg_module()
+    found = None
+    for path in mod.PINNING_PLIST_PATHS:
         try:
             with open(path, "rb") as fh:
                 data = plistlib.load(fh)
         except (OSError, plistlib.InvalidFileException, ValueError, TypeError):
             continue
-        stack = [data]
-        while stack:
-            item = stack.pop()
-            if isinstance(item, str) and item.strip().lower() == needle:
-                return True
-            if isinstance(item, dict):
-                stack.extend(item.values())
-            elif isinstance(item, (list, tuple)):
-                stack.extend(item)
-    return False
+        pins = mod.ordered_pins(data)
+        if pins:
+            return pins
+        if pins is not None:
+            found = []
+    return found
 
 
-def click_conversation_item(item: str, handle: str) -> None:
-    """Select a DM and click a Conversation-menu item while Messages is awake."""
-    why = select_chat(handle)
-    if why:
-        sys.stderr.write(f"imsg-read: {why}\n")
-        sys.exit(64)
-    prev = wake_messages()
+def chat_pinned(handle: str) -> Optional[bool]:
+    """Whether Messages lists this conversation as pinned; None when unknown.
+
+    Matches the way `imsg chats` finds a pin: every identifier in the
+    conversation cluster (a merged DM is pinned by whichever handle was
+    tapped), guids and group ids included, against the ordered pin list."""
+    pins = pin_list()
+    if pins is None:
+        return None
     try:
+        con = open_db()
+        try:
+            mod = imsg_module()
+            clusters = mod._group_cluster_map(con)
+            canon = clusters.get(handle, handle)
+            candidates = {handle, canon} | {c for c, k in clusters.items() if k == canon}
+            candidates.update(mod._cluster_pin_candidates(con, clusters).get(canon, ()))
+            pins = mod.expand_pins_via_lookup(con, pins)
+        finally:
+            con.close()
+    except Exception:
+        return None
+    return mod.pin_order_for(pins, *sorted(candidates)) is not None
+
+
+def settle_flag(fn, want: bool, tries: int = 8, pause: float = 0.4) -> Optional[bool]:
+    """Wait up to ~3 s for fn() to report `want`. A transient unknown keeps
+    waiting; the last reading is returned, so None at the end is unknown."""
+    got = fn()
+    for _ in range(tries):
+        if got is want:
+            return got
+        time.sleep(pause)
+        got = fn()
+    return got
+
+
+def keep_unread(handle: str, before) -> str:
+    """Put back an unread that opening the conversation just read.
+
+    Selecting a DM shows it, and Messages reads what it shows. A pin or a
+    mute is not a read, so the dot the user left there goes back on with the
+    same menu item --unread uses. "" when nothing was lost (or nothing was
+    unread to begin with), else why it could not be put back. A read receipt
+    Messages already sent cannot be recalled."""
+    if before is None:
+        return "could not tell beforehand whether it was unread"
+    if before == 0:
+        return ""
+    now = unread_on_mac(handle)
+    if now is None:
+        return "could not check whether opening it read it"
+    if now > 0:
+        return ""
+    ok, err = click("Mark as Unread")
+    if not ok and not err:
+        wake_messages()
+        ok, err = click("Mark as Unread")
+    if err:
+        return err
+    after = settle_unread(handle)
+    if after and after > 0:
+        return ""
+    return "Mark as Unread did not land" if ok else "Mark as Unread was not available"
+
+
+ACTIONS = {
+    "--pin": ("Pin", "chat_pinned", True, "pinned"),
+    "--unpin": ("Unpin", "chat_pinned", False, "unpinned"),
+    "--mute": ("Hide Alerts", "chat_muted", True, "muted"),
+    "--unmute": ("Show Alerts", "chat_muted", False, "unmuted"),
+}
+
+
+def conversation_action(flag: str, handle: str) -> None:
+    """Select a DM, click one Conversation-menu item, verify it in Messages'
+    own records, and hand focus back to whatever the user had in front.
+
+    The front app is captured BEFORE the conversation is opened: `open
+    imessage:` alone can bring Messages forward, and capturing after it
+    restored Messages to itself. Verification is tri-state and fails closed:
+    unknown (an unreadable pin list, a missing chat, a malformed plist) is
+    not success for the "on" actions or the "off" ones."""
+    item, probe_name, want, word = ACTIONS[flag]
+    probe = globals()[probe_name]
+    if GROUP_ID.fullmatch(handle):
+        sys.stderr.write(f"imsg-read: {flag} is for direct messages; this is a group\n")
+        sys.exit(64)
+    before = unread_on_mac(handle)
+    prev = frontmost()
+    selected = False
+    try:
+        why = select_chat(handle)
+        if why:
+            sys.stderr.write(f"imsg-read: {why}\n")
+            sys.exit(64)
+        selected = True
         ok, err = click(item)
+        # A disabled menu is dormant while Messages is in the background.
         if not ok and not err:
+            wake_messages()
             ok, err = click(item)
         if err:
             sys.stderr.write(f"imsg-read: {err}\n")
@@ -363,18 +470,23 @@ def click_conversation_item(item: str, handle: str) -> None:
         if not ok:
             sys.stderr.write(f"imsg-read: {item!r} was not available\n")
             sys.exit(1)
+        got = settle_flag(lambda: probe(handle), want)
     finally:
+        # Even a failed click opened the conversation; put its unread back
+        # while it is still the selected one, then hand focus back.
+        lost = keep_unread(handle, before) if selected else ""
+        if lost:
+            sys.stderr.write(f"imsg-read: its unread state on the Mac may not have survived "
+                             f"opening it ({lost})\n")
         restore_front(prev)
-
-
-def settle_flag(fn, want: bool, tries: int = 8, pause: float = 0.4) -> Optional[bool]:
-    got = fn()
-    for _ in range(tries):
-        if got is None or got is want:
-            return got
-        time.sleep(pause)
-        got = fn()
-    return got
+    if got is None:
+        sys.stderr.write(f"imsg-read: {item} was clicked but Messages' records cannot "
+                         f"confirm the conversation is {word}\n")
+        sys.exit(75)
+    if got is not want:
+        sys.stderr.write(f"imsg-read: {item} was clicked but the conversation is not {word}\n")
+        sys.exit(75)
+    print(word)
 
 
 def frontmost() -> str:
@@ -537,28 +649,12 @@ def main() -> None:
             restore_front(prev)
         return
 
-    acts = {
-        "--pin": ("Pin", lambda h: chat_pinned(h), True, "pinned"),
-        "--unpin": ("Unpin", lambda h: chat_pinned(h), False, "unpinned"),
-        "--mute": ("Hide Alerts", lambda h: chat_muted(h), True, "muted"),
-        "--unmute": ("Show Alerts", lambda h: chat_muted(h), False, "unmuted"),
-    }
-    if argv[0] in acts:
+    if argv[0] in ACTIONS:
         if len(argv) < 2:
             sys.stderr.write(f"imsg-read: {argv[0]} needs a handle\n")
             sys.exit(64)
-        item, probe, want, word = acts[argv[0]]
-        handle = argv[1]
-        click_conversation_item(item, handle)
-        got = settle_flag(lambda: probe(handle), want)
-        if got is want:
-            print(word)
-            return
-        if got is None:
-            sys.stderr.write(f"imsg-read: cannot verify the conversation is {word}\n")
-            sys.exit(75)
-        sys.stderr.write(f"imsg-read: {item} was clicked but the conversation is not {word}\n")
-        sys.exit(75)
+        conversation_action(argv[0], argv[1])
+        return
 
     sys.stderr.write(f"imsg-read: unknown option {argv[0]!r}\n")
     sys.exit(64)
